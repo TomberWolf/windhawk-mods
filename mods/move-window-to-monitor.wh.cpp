@@ -2,10 +2,10 @@
 // @id              move-window-to-monitor
 // @name            Move Window to Monitor
 // @description     Moves the active window to a specific monitor using configurable hotkeys (default: Ctrl+Alt+Arrows)
-// @version         1.0
+// @version         1.1.0
 // @author          TomberWolf
-// @github			https://github.com/TomberWolf
-// @include         explorer.exe
+// @github          https://github.com/TomberWolf
+// @include         windhawk.exe
 // @compilerOptions -luser32 -lgdi32 -lshcore
 // @license         MIT
 // ==/WindhawkMod==
@@ -83,6 +83,10 @@ of preserving its relative position. Works independently of **Keep window size**
 #define HOTKEY_LEFT  3
 #define HOTKEY_RIGHT 4
 
+// Custom message posted from WhTool_ModSettingsChanged to the hotkey thread
+// so that (Un)RegisterHotKey always runs on the thread that owns the window.
+#define WM_APP_SETTINGS_CHANGED (WM_APP + 1)
+
 struct ModSettings {
     UINT modifierKeys = MOD_CONTROL | MOD_ALT;
     int  targetUp     = -1;
@@ -111,10 +115,10 @@ static void LoadSettings() {
     PCWSTR s = Wh_GetStringSetting(L"modifierKeys");
     g_settings.modifierKeys = SettingToMod(s);
     Wh_FreeStringSetting(s);
-    g_settings.targetUp    = Wh_GetIntSetting(L"targetUp");
-    g_settings.targetDown  = Wh_GetIntSetting(L"targetDown");
-    g_settings.targetLeft  = Wh_GetIntSetting(L"targetLeft");
-    g_settings.targetRight = Wh_GetIntSetting(L"targetRight");
+    g_settings.targetUp     = Wh_GetIntSetting(L"targetUp");
+    g_settings.targetDown   = Wh_GetIntSetting(L"targetDown");
+    g_settings.targetLeft   = Wh_GetIntSetting(L"targetLeft");
+    g_settings.targetRight  = Wh_GetIntSetting(L"targetRight");
     g_settings.keepSize     = Wh_GetIntSetting(L"keepSize") != 0;
     g_settings.centerOnMove = Wh_GetIntSetting(L"centerOnMove") != 0;
 }
@@ -123,7 +127,7 @@ static void LoadSettings() {
 
 struct MonitorInfo {
     HMONITOR hMon;
-    RECT     rcWork;   // physical pixels, DPI-unaware (virtual desktop coords)
+    RECT     rcWork;
     UINT     dpiX;
     UINT     dpiY;
 };
@@ -139,8 +143,6 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) 
     info.dpiX   = 96;
     info.dpiY   = 96;
 
-    // Try to get per-monitor DPI (Windows 8.1+)
-    // GetDpiForMonitor is in shcore.dll
     typedef HRESULT (WINAPI* GetDpiForMonitorFn)(HMONITOR, int, UINT*, UINT*);
     static auto fn = reinterpret_cast<GetDpiForMonitorFn>(
         GetProcAddress(GetModuleHandle(L"shcore.dll"), "GetDpiForMonitor"));
@@ -154,7 +156,6 @@ static std::vector<MonitorInfo> GetAllMonitors() {
     std::vector<MonitorInfo> list;
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc,
                         reinterpret_cast<LPARAM>(&list));
-    // Sort left→right, then top→bottom (physical coords)
     std::sort(list.begin(), list.end(), [](const MonitorInfo& a, const MonitorInfo& b) {
         if (a.rcWork.left != b.rcWork.left)
             return a.rcWork.left < b.rcWork.left;
@@ -167,7 +168,6 @@ static POINT RectCenter(const RECT& r) {
     return { (r.left + r.right) / 2, (r.top + r.bottom) / 2 };
 }
 
-// Find the index of the monitor that a given HMONITOR corresponds to
 static int FindMonitorIndex(const std::vector<MonitorInfo>& monitors, HMONITOR hMon) {
     for (int i = 0; i < (int)monitors.size(); i++)
         if (monitors[i].hMon == hMon) return i;
@@ -175,7 +175,7 @@ static int FindMonitorIndex(const std::vector<MonitorInfo>& monitors, HMONITOR h
 }
 
 static void LogAllMonitors(const std::vector<MonitorInfo>& monitors) {
-    Wh_Log(L"=== Move Window to Monitor v5: %d monitor(s) detected ===",
+    Wh_Log(L"=== Move Window to Monitor v6: %d monitor(s) detected ===",
            (int)monitors.size());
     Wh_Log(L"Sorted left-to-right, then top-to-bottom:");
     for (int i = 0; i < (int)monitors.size(); i++) {
@@ -197,7 +197,7 @@ enum class Direction { Up, Down, Left, Right };
 
 static void MoveWindowToMonitor(HWND hwnd, const MonitorInfo& src, const MonitorInfo& dst) {
     bool wasMaximized = IsZoomed(hwnd);
-    if (wasMaximized) ShowWindow(hwnd, SW_RESTORE);
+    if (wasMaximized) ShowWindowAsync(hwnd, SW_RESTORE);
 
     RECT rcWin = {};
     GetWindowRect(hwnd, &rcWin);
@@ -209,14 +209,11 @@ static void MoveWindowToMonitor(HWND hwnd, const MonitorInfo& src, const Monitor
     int dstW = dst.rcWork.right  - dst.rcWork.left;
     int dstH = dst.rcWork.bottom - dst.rcWork.top;
 
-    // Relative position on source monitor (0.0 .. 1.0)
     float relX = srcW > 0 ? (float)(rcWin.left - src.rcWork.left) / srcW : 0.0f;
     float relY = srcH > 0 ? (float)(rcWin.top  - src.rcWork.top)  / srcH : 0.0f;
 
     int newW, newH;
     if (g_settings.keepSize) {
-        // Keep pixel size, but scale for DPI difference between monitors
-        // so the window appears the same physical size on screen
         float dpiScaleX = (dst.dpiX > 0 && src.dpiX > 0)
                           ? (float)dst.dpiX / src.dpiX : 1.0f;
         float dpiScaleY = (dst.dpiY > 0 && src.dpiY > 0)
@@ -224,23 +221,19 @@ static void MoveWindowToMonitor(HWND hwnd, const MonitorInfo& src, const Monitor
         newW = (int)(ww * dpiScaleX);
         newH = (int)(wh * dpiScaleY);
     } else {
-        // Scale proportionally to target monitor work area
         newW = (int)(ww * (float)dstW / srcW);
         newH = (int)(wh * (float)dstH / srcH);
     }
 
     int newX, newY;
     if (g_settings.centerOnMove) {
-        // Center on target monitor work area
         newX = dst.rcWork.left + (dstW - newW) / 2;
         newY = dst.rcWork.top  + (dstH - newH) / 2;
     } else {
-        // Preserve relative position
         newX = dst.rcWork.left + (int)(relX * dstW);
         newY = dst.rcWork.top  + (int)(relY * dstH);
     }
 
-    // Clamp to target work area
     if (newX + newW > dst.rcWork.right)  newX = dst.rcWork.right  - newW;
     if (newY + newH > dst.rcWork.bottom) newY = dst.rcWork.bottom - newH;
     if (newX < dst.rcWork.left)          newX = dst.rcWork.left;
@@ -249,7 +242,7 @@ static void MoveWindowToMonitor(HWND hwnd, const MonitorInfo& src, const Monitor
     SetWindowPos(hwnd, nullptr, newX, newY, newW, newH,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 
-    if (wasMaximized) ShowWindow(hwnd, SW_MAXIMIZE);
+    if (wasMaximized) ShowWindowAsync(hwnd, SW_MAXIMIZE);
 }
 
 static void MoveActiveWindowInDirection(Direction dir) {
@@ -264,7 +257,6 @@ static void MoveActiveWindowInDirection(Direction dir) {
     int  curIdx   = FindMonitorIndex(monitors, hCurrent);
     if (curIdx < 0) return;
 
-    // Determine fixed target index for this direction
     int fixedIndex = -1;
     switch (dir) {
         case Direction::Up:    fixedIndex = g_settings.targetUp;    break;
@@ -276,15 +268,11 @@ static void MoveActiveWindowInDirection(Direction dir) {
     int dstIdx = -1;
 
     if (fixedIndex >= 0 && fixedIndex < (int)monitors.size()) {
-        // Fixed target: only move if we're not already there
-        if (fixedIndex != curIdx) {
+        if (fixedIndex != curIdx)
             dstIdx = fixedIndex;
-        }
-        // If already on target monitor: do nothing (no fallback to geometry)
     }
 
     if (dstIdx < 0 && fixedIndex < 0) {
-        // No fixed index configured (-1): use geometric search
         POINT curCenter = RectCenter(monitors[curIdx].rcWork);
         int   bestScore = INT_MAX;
 
@@ -320,19 +308,6 @@ static void MoveActiveWindowInDirection(Direction dir) {
 
 // ── hotkey thread ─────────────────────────────────────────────────────────────
 
-static LRESULT CALLBACK HotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_HOTKEY) {
-        switch ((int)wParam) {
-            case HOTKEY_UP:    MoveActiveWindowInDirection(Direction::Up);    break;
-            case HOTKEY_DOWN:  MoveActiveWindowInDirection(Direction::Down);  break;
-            case HOTKEY_LEFT:  MoveActiveWindowInDirection(Direction::Left);  break;
-            case HOTKEY_RIGHT: MoveActiveWindowInDirection(Direction::Right); break;
-        }
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
 static void RegisterHotkeys(HWND hwnd) {
     UINT mod = g_settings.modifierKeys | MOD_NOREPEAT;
     RegisterHotKey(hwnd, HOTKEY_UP,    mod, VK_UP);
@@ -346,6 +321,30 @@ static void UnregisterHotkeys(HWND hwnd) {
     UnregisterHotKey(hwnd, HOTKEY_DOWN);
     UnregisterHotKey(hwnd, HOTKEY_LEFT);
     UnregisterHotKey(hwnd, HOTKEY_RIGHT);
+}
+
+static LRESULT CALLBACK HotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_HOTKEY) {
+        switch ((int)wParam) {
+            case HOTKEY_UP:    MoveActiveWindowInDirection(Direction::Up);    break;
+            case HOTKEY_DOWN:  MoveActiveWindowInDirection(Direction::Down);  break;
+            case HOTKEY_LEFT:  MoveActiveWindowInDirection(Direction::Left);  break;
+            case HOTKEY_RIGHT: MoveActiveWindowInDirection(Direction::Right); break;
+        }
+        return 0;
+    }
+
+    if (msg == WM_APP_SETTINGS_CHANGED) {
+        // (Un)RegisterHotKey must run on the thread that owns the window
+        UnregisterHotkeys(hwnd);
+        LoadSettings();
+        auto monitors = GetAllMonitors();
+        LogAllMonitors(monitors);
+        RegisterHotkeys(hwnd);
+        return 0;
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 static void HotkeyThreadProc() {
@@ -381,10 +380,10 @@ static DWORD WINAPI HotkeyThreadEntry(LPVOID) {
     return 0;
 }
 
-// ── Windhawk callbacks ────────────────────────────────────────────────────────
+// ── Tool mod callbacks (renamed as required by the tool mod pattern) ──────────
 
-BOOL Wh_ModInit() {
-    Wh_Log(L"MoveWindowToMonitor v5: Init");
+BOOL WhTool_ModInit() {
+    Wh_Log(L"MoveWindowToMonitor v6: Init");
     LoadSettings();
     auto monitors = GetAllMonitors();
     LogAllMonitors(monitors);
@@ -393,7 +392,12 @@ BOOL Wh_ModInit() {
     return g_hThread != nullptr;
 }
 
-void Wh_ModUninit() {
+void WhTool_ModSettingsChanged() {
+    Wh_Log(L"MoveWindowToMonitor: Settings changed, notifying hotkey thread");
+    if (g_hMsgWnd) PostMessage(g_hMsgWnd, WM_APP_SETTINGS_CHANGED, 0, 0);
+}
+
+void WhTool_ModUninit() {
     g_running = false;
     if (g_hMsgWnd) PostMessage(g_hMsgWnd, WM_QUIT, 0, 0);
     if (g_hThread) {
@@ -403,11 +407,171 @@ void Wh_ModUninit() {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Windhawk tool mod implementation for mods which don't need to inject to other
+// processes or hook other functions. Context:
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+//
+// The mod will load and run in a dedicated windhawk.exe process.
+
+bool g_isToolModProcessLauncher;
+HANDLE g_toolModProcessMutex;
+
+void WINAPI EntryPoint_Hook() {
+    Wh_Log(L">");
+    ExitThread(0);
+}
+
+BOOL Wh_ModInit() {
+    DWORD sessionId;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
+        sessionId == 0) {
+        return FALSE;
+    }
+
+    bool isExcluded = false;
+    bool isToolModProcess = false;
+    bool isCurrentToolModProcess = false;
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
+    if (!argv) {
+        Wh_Log(L"CommandLineToArgvW failed");
+        return FALSE;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"-service") == 0 ||
+            wcscmp(argv[i], L"-service-start") == 0 ||
+            wcscmp(argv[i], L"-service-stop") == 0) {
+            isExcluded = true;
+            break;
+        }
+    }
+
+    for (int i = 1; i < argc - 1; i++) {
+        if (wcscmp(argv[i], L"-tool-mod") == 0) {
+            isToolModProcess = true;
+            if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
+                isCurrentToolModProcess = true;
+            }
+            break;
+        }
+    }
+
+    LocalFree(argv);
+
+    if (isExcluded) {
+        return FALSE;
+    }
+
+    if (isCurrentToolModProcess) {
+        g_toolModProcessMutex =
+            CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+        if (!g_toolModProcessMutex) {
+            Wh_Log(L"CreateMutex failed");
+            ExitProcess(1);
+        }
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+            ExitProcess(1);
+        }
+
+        if (!WhTool_ModInit()) {
+            ExitProcess(1);
+        }
+
+        IMAGE_DOS_HEADER* dosHeader =
+            (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
+        IMAGE_NT_HEADERS* ntHeaders =
+            (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
+
+        DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+        void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
+
+        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
+        return TRUE;
+    }
+
+    if (isToolModProcess) {
+        return FALSE;
+    }
+
+    g_isToolModProcessLauncher = true;
+    return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    if (!g_isToolModProcessLauncher) {
+        return;
+    }
+
+    WCHAR currentProcessPath[MAX_PATH];
+    switch (GetModuleFileName(nullptr, currentProcessPath,
+                              ARRAYSIZE(currentProcessPath))) {
+        case 0:
+        case ARRAYSIZE(currentProcessPath):
+            Wh_Log(L"GetModuleFileName failed");
+            return;
+    }
+
+    WCHAR commandLine[MAX_PATH + 2 +
+                      (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
+    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath,
+               WH_MOD_ID);
+
+    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
+    if (!kernelModule) {
+        kernelModule = GetModuleHandle(L"kernel32.dll");
+        if (!kernelModule) {
+            Wh_Log(L"No kernelbase.dll/kernel32.dll");
+            return;
+        }
+    }
+
+    using CreateProcessInternalW_t = BOOL(WINAPI*)(
+        HANDLE hUserToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
+        LPSECURITY_ATTRIBUTES lpProcessAttributes,
+        LPSECURITY_ATTRIBUTES lpThreadAttributes, WINBOOL bInheritHandles,
+        DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
+        LPSTARTUPINFOW lpStartupInfo,
+        LPPROCESS_INFORMATION lpProcessInformation,
+        PHANDLE hRestrictedUserToken);
+    CreateProcessInternalW_t pCreateProcessInternalW =
+        (CreateProcessInternalW_t)GetProcAddress(kernelModule,
+                                                 "CreateProcessInternalW");
+    if (!pCreateProcessInternalW) {
+        Wh_Log(L"No CreateProcessInternalW");
+        return;
+    }
+
+    STARTUPINFO si{
+        .cb = sizeof(STARTUPINFO),
+        .dwFlags = STARTF_FORCEOFFFEEDBACK,
+    };
+    PROCESS_INFORMATION pi;
+    if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
+                                 nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
+                                 nullptr, nullptr, &si, &pi, nullptr)) {
+        Wh_Log(L"CreateProcess failed");
+        return;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
 void Wh_ModSettingsChanged() {
-    Wh_Log(L"MoveWindowToMonitor: Settings changed");
-    if (g_hMsgWnd) UnregisterHotkeys(g_hMsgWnd);
-    LoadSettings();
-    auto monitors = GetAllMonitors();
-    LogAllMonitors(monitors);
-    if (g_hMsgWnd) RegisterHotkeys(g_hMsgWnd);
+    if (g_isToolModProcessLauncher) {
+        return;
+    }
+    WhTool_ModSettingsChanged();
+}
+
+void Wh_ModUninit() {
+    if (g_isToolModProcessLauncher) {
+        return;
+    }
+    WhTool_ModUninit();
+    ExitProcess(0);
 }
